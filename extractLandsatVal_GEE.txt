@@ -1,0 +1,228 @@
+var pts = ee.FeatureCollection("projects/ee-pinkychow1010/assets/datapoint_00_05")
+
+var months = ee.List.sequence(1, 12);
+var years = ee.List.sequence(1988, 2020);
+
+function fmask(img) {
+  var cloudShadowBitMask = 1 << 3;
+  var cloudsBitMask = 1 << 5;
+  var qa = img.select('pixel_qa');
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+    .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return img.updateMask(mask);
+}
+
+// Selects and renames bands of interest for Landsat OLI.
+function renameOli(img) {
+  return img.select(
+    ['B2', 'B3', 'B4', 'B5', 'B6', 'B7'],
+    ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2']);
+}
+
+// Selects and renames bands of interest for TM/ETM+.
+function renameEtm(img) {
+  return img.select(
+    ['B1', 'B2', 'B3', 'B4', 'B5', 'B7'],
+    ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2']);
+}
+
+// Prepares (cloud masks and renames) OLI images.
+function prepOli(img) {
+  img = fmask(img);
+  img = renameOli(img);
+  return img;
+}
+
+// Prepares (cloud masks and renames) TM/ETM+ images.
+function prepEtm(img) {
+  img = fmask(img);
+  img = renameEtm(img);
+  return img;
+}
+
+function bufferPoints(radius, bounds) {
+  return function(pt) {
+    pt = ee.Feature(pt);
+    return bounds ? pt.buffer(radius).bounds() : pt.buffer(radius);
+  };
+}
+
+var ptsLandsat = pts.map(bufferPoints(15, true));
+
+var oliCol = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+  .filterBounds(ptsLandsat)
+  .map(prepOli);
+
+var etmCol = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR')
+  .filterBounds(ptsLandsat)
+  .map(prepEtm);
+
+var tmCol = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR')
+  .filterBounds(ptsLandsat)
+  .map(prepEtm);
+  
+var byMonthYear_oliCol = ee.ImageCollection.fromImages(
+  years.map(function(y) {
+    return months.map(function (m) {
+      return oliCol
+        .filter(ee.Filter.calendarRange(y, y, 'year'))
+        .filter(ee.Filter.calendarRange(m, m, 'month'))
+        .filterMetadata('CLOUD_COVER', 'less_than', 0.2)
+        .select(['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2'])
+        .mean()
+        .set('month', m).set('year', y);
+  });
+}).flatten()); 
+
+var byMonthYear_etmCol = ee.ImageCollection.fromImages(
+  years.map(function(y) {
+    return months.map(function (m) {
+      return etmCol
+        .filter(ee.Filter.calendarRange(y, y, 'year'))
+        .filter(ee.Filter.calendarRange(m, m, 'month'))
+        .select(['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2'])
+        .mean()
+        .set('month', m).set('year', y);
+  });
+}).flatten()); 
+
+var byMonthYear_tmCol = ee.ImageCollection.fromImages(
+  years.map(function(y) {
+    return months.map(function (m) {
+      return tmCol
+        .filter(ee.Filter.calendarRange(y, y, 'year'))
+        .filter(ee.Filter.calendarRange(m, m, 'month'))
+        .select(['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2'])
+        .mean()
+        .set('month', m).set('year', y);
+  });
+}).flatten()); 
+
+print(etmCol)
+print(byMonthYear_etmCol)
+
+var landsatCol2 = byMonthYear_oliCol.merge(byMonthYear_etmCol).merge(byMonthYear_tmCol);
+var landsatCol = oliCol.merge(etmCol).merge(tmCol);
+
+print(landsatCol)
+print(landsatCol2)
+
+var composites = ee.ImageCollection.fromImages(years.map(function(y) {
+  return months.map(function(m) {
+  var filtered = landsatCol
+  .filter(ee.Filter.calendarRange(y,y, 'year'))
+  .filter(ee.Filter.calendarRange(m,m, 'month'));
+  var composite = filtered.median();
+  var systemStart = filtered.reduceColumns(ee.Reducer.min(), ['system:time_start']).get('min');
+  return composite.set('month', m).set('year', y).set('system:time_start', systemStart);
+  });
+}).flatten());
+
+//print(composites.first().bandNames())
+
+// Define parameters for the zonalStats function.
+var params = {
+  reducer: ee.Reducer.mean(),
+  scale: 30,
+  crs: 'EPSG:5070',
+  bands: ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2'],
+  //bandsRename: ['ls_blue', 'ls_green', 'ls_red', 'ls_nir', 'ls_swir1', 'ls_swir2'],
+  //imgProps: ['LANDSAT_ID', 'SATELLITE'],
+  //imgPropsRename: ['img_id', 'satellite'],
+  datetimeName: 'date',
+  datetimeFormat: 'YYYY-MM-dd'
+};
+
+
+var listOfImages = composites.toList(composites.size());
+
+var newList = listOfImages.map(function comprobeBandsNumber(ele){
+  var new_list = ee.List([]); 
+  var count = ee.Image(ele).bandNames().size();
+  var comp = ee.Algorithms.If(count.eq(6), ele, 0);
+  new_list = new_list.add(comp);
+  return new_list;
+}).flatten();
+
+newList = newList.removeAll([0]);
+print(newList);
+
+//creating new collection
+var clean_composites = ee.ImageCollection(newList);
+
+// Extract zonal statistics per point per image.
+var ptsLandsatStats = zonalStats(clean_composites, ptsLandsat, params);
+print(ptsLandsatStats.limit(10));
+
+// Export Results
+
+Export.table.toDrive({
+  collection: ptsLandsatStats,
+  //folder: 'DeepLearningProject',
+  description: 'testing_point_by_month',
+  fileFormat: 'CSV'
+});
+
+function zonalStats(ic, fc, params) {
+  // Initialize internal params dictionary.
+  var _params = {
+    reducer: ee.Reducer.mean(),
+    scale: null,
+    crs: null,
+    bands: null,
+    bandsRename: null,
+    imgProps: null,
+    imgPropsRename: null,
+    datetimeName: 'datetime',
+    datetimeFormat: 'YYYY-MM-dd HH:mm:ss'
+  };
+  
+  // Replace initialized params with provided params.
+  if (params) {
+    for (var param in params) {
+      _params[param] = params[param] || _params[param];
+    }
+  }
+  
+  
+  // Set default parameters based on an image representative.
+  var imgRep = ic.first();
+  var nonSystemImgProps = ee.Feature(null)
+    .copyProperties(imgRep).propertyNames();
+  if (!_params.bands) _params.bands = imgRep.bandNames();
+  if (!_params.bandsRename) _params.bandsRename = _params.bands;
+  if (!_params.imgProps) _params.imgProps = nonSystemImgProps;
+  if (!_params.imgPropsRename) _params.imgPropsRename = _params.imgProps;
+  
+  // Map the reduceRegions function over the image collection.
+  var results = ic.map(function(img) {
+    // Select bands (optionally rename), set a datetime & timestamp property.
+    img = ee.Image(img.select(_params.bands, _params.bandsRename))
+      .set(_params.datetimeName, img.date().format(_params.datetimeFormat))
+      .set('timestamp', img.get('system:time_start'));
+
+    // Define final image property dictionary to set in output features.
+    var propsFrom = ee.List(_params.imgProps)
+      .cat(ee.List([_params.datetimeName, 'timestamp']));
+    var propsTo = ee.List(_params.imgPropsRename)
+      .cat(ee.List([_params.datetimeName, 'timestamp']));
+    var imgProps = img.toDictionary(propsFrom).rename(propsFrom, propsTo);
+    
+    // Subset points that intersect the given image.
+    var fcSub = fc.filterBounds(img.geometry());
+    
+    // Reduce the image by regions.
+    return img.reduceRegions({
+      collection: fcSub,
+      reducer: _params.reducer,
+      scale: _params.scale,
+      crs: _params.crs
+    })
+    // Add metadata to each feature.
+    .map(function(f) {
+      return f.set(imgProps);
+    });
+  }).flatten().filter(ee.Filter.notNull(_params.bandsRename));
+  
+  return results;
+}
