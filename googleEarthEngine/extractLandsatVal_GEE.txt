@@ -1,8 +1,13 @@
+// this script aims to extract time series of Landsat gridded dataset for the locust outbreaks
+
+// import data points
 var pts = ee.FeatureCollection("projects/ee-pinkychow1010/assets/datapoint_00_05")
 
+// define months and years
 var months = ee.List.sequence(1, 12);
 var years = ee.List.sequence(1988, 2020);
 
+// function for masking clouds
 function fmask(img) {
   var cloudShadowBitMask = 1 << 3;
   var cloudsBitMask = 1 << 5;
@@ -40,6 +45,7 @@ function prepEtm(img) {
   return img;
 }
 
+// Create buffered areas from the points
 function bufferPoints(radius, bounds) {
   return function(pt) {
     pt = ee.Feature(pt);
@@ -49,6 +55,7 @@ function bufferPoints(radius, bounds) {
 
 var ptsLandsat = pts.map(bufferPoints(15, true));
 
+// filter points and do pre-processing
 var oliCol = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
   .filterBounds(ptsLandsat)
   .map(prepOli);
@@ -60,7 +67,8 @@ var etmCol = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR')
 var tmCol = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR')
   .filterBounds(ptsLandsat)
   .map(prepEtm);
-  
+
+// Get composites by year and by month - for Landsat 5,7,8 respectively  
 var byMonthYear_oliCol = ee.ImageCollection.fromImages(
   years.map(function(y) {
     return months.map(function (m) {
@@ -133,9 +141,10 @@ var params = {
   datetimeFormat: 'YYYY-MM-dd'
 };
 
-
+// List of the Landsat dataset
 var listOfImages = composites.toList(composites.size());
 
+// Remove all images in the list with variables not equal to 6 (eg. images with no bands)
 var newList = listOfImages.map(function comprobeBandsNumber(ele){
   var new_list = ee.List([]); 
   var count = ee.Image(ele).bandNames().size();
@@ -163,6 +172,7 @@ Export.table.toDrive({
   fileFormat: 'CSV'
 });
 
+// Function for zonal statistics - to extract pixel values in raster stacks using point coordinates
 function zonalStats(ic, fc, params) {
   // Initialize internal params dictionary.
   var _params = {
